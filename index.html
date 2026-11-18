@@ -90,6 +90,18 @@ pre.raw{margin:8px 0 0;max-height:220px;overflow:auto;font:11.5px/1.35 ui-monosp
 .pillst.ok{background:var(--ok-bg);color:var(--ok)} .pillst.warn{background:var(--warn-bg);color:var(--warn)} .pillst.bad{background:var(--bad-bg);color:var(--bad)} .pillst.info{background:var(--info-bg);color:var(--info)} .pillst.none{background:var(--none-bg);color:var(--none)}
 .addbtns{display:flex;flex-wrap:wrap;gap:6px}
 #stage{min-width:0;overflow:visible}
+#countBar{margin:0 0 12px;max-width:793px}
+#countBar .cb{border-radius:10px;padding:10px 14px;font-size:14px;line-height:1.45;border:2px solid}
+#countBar .cb b{font-weight:800}
+#countBar .cb.ok{background:var(--ok-bg);color:var(--ok);border-color:var(--ok)}
+#countBar .cb.warn{background:var(--warn-bg);color:var(--warn);border-color:var(--warn)}
+#countBar .cb.bad{background:var(--bad-bg);color:var(--bad);border-color:var(--bad)}
+#countBar .cb .big{font-size:16px;font-weight:800;display:block;margin-bottom:2px}
+#countBar .cb ul{margin:6px 0 0;padding-left:20px}
+#countBar .cb li{margin:3px 0}
+#countBar .cb button{margin-left:8px}
+.row.txt .dtext textarea{font-style:italic}
+
 #pages{display:flex;flex-direction:column;align-items:center;gap:18px;transform-origin:top left}
 .sizer{margin:0 auto}
 
@@ -458,7 +470,7 @@ pre.raw{margin:8px 0 0;max-height:220px;overflow:auto;font:11.5px/1.35 ui-monosp
       <details class="panel" id="pRaw"><summary>Text the app found (for checking)</summary><pre class="raw" id="rawText"></pre></details>
       <div class="panel"><h2>What the checks mean</h2><div class="legendkey" id="legendKey"></div></div>
     </aside>
-    <div id="stage" class="editing"><div class="sizer" id="sizer"><div id="pages"></div></div></div>
+    <div id="stage" class="editing"><div id="countBar" class="noprint" role="status" aria-live="polite"></div><div class="sizer" id="sizer"><div id="pages"></div></div></div>
   </div>
 </main>
 
@@ -503,6 +515,7 @@ const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt
 let _u = 0; const uid = () => 'l' + Date.now().toString(36) + (++_u).toString(36);
 const clone = o => JSON.parse(JSON.stringify(o));
 const num = v => { const n = parseFloat(String(v).replace(',', '.')); return isFinite(n) ? n : NaN; };
+const noSign = it => !!it && (it.kind === 'hardware' || it.kind === 'note');      // hardware and plain text lines have no sign picture
 const median = a => { if (!a.length) return 0; const s = [...a].sort((x, y) => x - y); const m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; };
 
 const HOSTED = false;                  // set to true by the build for the hosted copy (no print window, no picture reading)
@@ -555,6 +568,8 @@ const S = {
   source: { name: '', method: '', pages: 0, previews: [] },
   header: clone(DEFAULT_HEADER),
   items: [], originalOrder: [], leftovers: [], rawLines: [], readNotes: [],
+  check: null,                         // the double-check made when the jobsheet was read (rows read vs rows the page shows)
+  removedInfo: {},                     // what the lines you deleted said, so that they can be put back
   savedAt: null
 };
 let history = [];
@@ -579,7 +594,7 @@ document.addEventListener('visibilitychange', () => { if (document.visibilitySta
 function saveNow() {
   if (!S.items.length && !S.header.no) return;
   S.savedAt = new Date().toISOString();
-  const payload = { v: 1, savedAt: S.savedAt, source: S.source, header: S.header, items: S.items.map(({ d, ...rest }) => rest), originalOrder: S.originalOrder, leftovers: S.leftovers, rawLines: S.rawLines, readNotes: S.readNotes };
+  const payload = { v: 1, savedAt: S.savedAt, source: S.source, header: S.header, items: S.items.map(({ d, ...rest }) => rest), originalOrder: S.originalOrder, leftovers: S.leftovers, rawLines: S.rawLines, readNotes: S.readNotes, check: S.check, removedInfo: S.removedInfo };
   try { localStorage.setItem(STORE_KEY, JSON.stringify(payload)); return; } catch (e) { /* too big or blocked */ }
   try { payload.source = { ...S.source, previews: [] }; localStorage.setItem(STORE_KEY, JSON.stringify(payload)); } catch (e) { /* storage unavailable: keep working without autosave */ }
 }
@@ -633,37 +648,96 @@ const joinToks = toks => toks.slice().sort((a, b) => a.x0 - b.x0).map(t => t.t).
 const NOISE = /^[|\[\]!_\\\/.,:;'"`~\-—–]{1,2}$/;
 const BORDER = /^[|\[\]!_\\]{1,3}$/;   // table lines the picture reader mistakes for characters
 
-function buildRows(lines, hdr, geo, anchors) {
-  const rows = []; const leftovers = []; let cur = null; let prev = null; let lastHdr = null;
+/* ---------- the shading of the table ----------
+   The rows of the jobsheet table are shaded white and light grey in turn. Counting those bands in the page picture gives a row count that does not
+   depend on reading a single letter, so it is used to double-check the rows that were read, and to tell where one row ends and the next begins. */
+const QTY_RE = /^\d+(?:[.,]\d+)?$/;
+const ITEM_GAP = 6;       // two lines of the item column closer than this belong to the same item name ("Aluminium" / "Sign")
+const CONT_GAP = 16;      // a text line further than this below the line above is not a continuation of it (when no shading is available)
+function pageBands(canvas, topY, geo) {
+  try {
+    const k = canvas.width / PAGE_W;
+    const xE = Math.min(geo.xRight - 4, geo.xDesc + 322);                           // right edge of the DESCRIPTION cell (the picture reader's guess for the table's right side can be too far out)
+    const x1 = Math.round((xE - 12) * k), x0 = Math.round((xE - 32) * k), w = x1 - x0;
+    const y0 = Math.max(0, Math.round(topY * k)), h = canvas.height - y0;
+    if (w < 4 || h < 60) return null;
+    const px = canvas.getContext('2d').getImageData(x0, y0, w, h).data;
+    const lum = new Float32Array(h);
+    for (let y = 0; y < h; y++) { let m = 0; for (let x = 0; x < w; x++) { const i = (y * w + x) * 4, l = 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2]; if (l > m) m = l; } lum[y] = m; }   // lightest pixel of the strip = the background (text is darker)
+    const sorted = Float32Array.from(lum).sort(), white = sorted[Math.floor(sorted.length * 0.93)];
+    if (white < 200) return null;                                                 // a dark or photographed page: no shading to read
+    const cls = new Array(h);
+    for (let y = 0; y < h; y++) { const d = white - lum[y]; cls[y] = d <= 4 ? 'W' : d <= 26 ? 'G' : d <= 75 ? 'H' : 'D'; }
+    const runs = []; let s = 0;
+    for (let y = 1; y <= h; y++) if (y === h || cls[y] !== cls[s]) { runs.push({ c: cls[s], a: s, b: y - 1 }); s = y; }
+    // the grey heading cell comes first; the rows start under it
+    let first = -1;
+    for (let i = 0; i < runs.length; i++) { const r = runs[i]; if (r.c === 'H' && (r.b - r.a) >= 14 * k) { first = i; break; } if (r.a > 70 * k) break; }
+    if (first < 0) return null;
+    const seq = [];
+    for (let i = first + 1; i < runs.length; i++) {
+      const r = runs[i]; if ((r.c === 'D' || r.c === 'H') && (r.b - r.a) < 7 * k) continue;     // a thin border line
+      if (r.c === 'D' || r.c === 'H') { if (seq.length) break; else continue; }
+      if (seq.length && seq[seq.length - 1].c === r.c) seq[seq.length - 1].b = r.b; else seq.push({ ...r });
+    }
+    if (!seq.length) return null;
+    const unit = v => (y0 + v) / k;
+    const bands = seq.map(r => ({ y0: unit(r.a), y1: unit(r.b + 1), shade: r.c }));
+    const last = seq[seq.length - 1]; let ink = false;
+    if (last.c === 'W') {                                                          // the last white band is either the empty rest of the table or a white row
+      const ax = Math.round(geo.xDesc * k), bx = Math.round((xE - 6) * k), ay = y0 + last.a, ah = Math.min(Math.round(26 * k), canvas.height - ay);
+      if (bx - ax > 8 && ah > 4) { const q = canvas.getContext('2d').getImageData(ax + Math.round(9 * k), ay, bx - ax - Math.round(9 * k), ah).data; let n = 0; for (let i = 0; i < q.length; i += 4) if (q[i] < 140) n++; ink = n > 20; }
+    }
+    const greys = bands.filter(b => b.shade === 'G').length;
+    return { bands, openLast: last.c === 'W', ink, greys, rows: bands.length - (last.c === 'W' && !ink ? 1 : 0) };
+  } catch (e) { return null; }
+}
+/* the band (0-based, per page) that a y position falls in; the last white band is "open" and takes everything below it */
+function bandAt(pb, y) {
+  if (!pb || !pb.bands.length) return -1;
+  for (let i = 0; i < pb.bands.length; i++) if (y < pb.bands[i].y1 + 1.5) return y >= pb.bands[i].y0 - 3 ? i : (i ? i - 1 : -1);
+  return pb.openLast ? pb.bands.length - 1 : -1;
+}
+
+/* Every piece of text in the table ends up in a row — nothing is thrown away.
+   A row starts at a quantity, at the first line of an item name, or where the shading changes (or, without shading, after a clear gap).
+   A line that follows a row closely, or sits in the same shaded band, is part of that row ("Back to Back", "Class 1 Reflective"…). */
+function buildRows(lines, hdr, geo, anchors, bands) {
+  const rows = [], junk = []; let cur = null, prev = null, prevItem = false;
+  const pageHdr = new Map(); for (const l of lines) if (isHeaderLine(l) && !pageHdr.has(l.page)) pageHdr.set(l.page, l);
   for (const ln of lines) {
-    if (isHeaderLine(ln)) { prev = null; lastHdr = ln; continue; }
-    if (ln.page === hdr.line.page && ln.yc <= hdr.line.yc + 4) continue;
     if (ln.page < hdr.line.page) continue;
+    if (isHeaderLine(ln)) { cur = null; prev = null; prevItem = false; continue; }
+    const hl = pageHdr.get(ln.page);
+    if (ln.yc <= (hl ? hl.yc : hdr.line.yc) + 4) { junk.push({ page: ln.page, text: ln.text }); continue; }      // the page's own heading block (logo, address, ON COLLECTION…) is not part of the table
     const cells = { left: [], qty: [], item: [], desc: [], right: [] };
-    for (const k of ln.toks) { if (BORDER.test(k.t) || (NOISE.test(k.t) && (k.conf ?? 100) < 80)) continue; cells[colOf(k.x0, geo)].push(k); }
+    for (const k of ln.toks) {
+      if (BORDER.test(k.t) || (NOISE.test(k.t) && (k.conf ?? 100) < 80)) continue;
+      let c = colOf(k.x0, geo);
+      if (c === 'left' && QTY_RE.test(k.t) && k.x1 > geo.xQtyLeft + 8 && k.x1 <= geo.xItem + 2) c = 'qty';           // a long quantity (1500, 10000) starts further to the left
+      cells[c].push(k);
+    }
     if (!cells.item.length && !cells.desc.length && !cells.qty.length) continue;
-    if (lastHdr && ln.page === lastHdr.page && ln.yc < lastHdr.yc + 34 && /^(units|total|or|reprint|\W*)$/i.test(joinToks([...cells.qty, ...cells.item, ...cells.desc]))) continue;   // 2nd line of the heading cell
-    let starts = false, q = null;
-    if (anchors) {
-      const a = anchors.find(a => !a.used && a.page === ln.page && Math.abs(a.y - ln.yc) <= 6);
-      if (a && (cells.item.length || cells.desc.length)) { a.used = true; starts = true; q = { text: a.text, conf: a.conf }; }
-    } else {
-      const t = joinToks(cells.qty);
-      if (/^\d+(?:[.,]\d+)?$/.test(t)) { starts = true; q = { text: t, conf: Math.min(...cells.qty.map(k => k.conf ?? 100)) }; }
-    }
-    if (starts) {
-      cur = { page: ln.page, y0: ln.y0, y1: ln.y1, qty: q, itemLines: [], descLines: [], toks: [] };
-      rows.push(cur);
-    } else {
-      const gapOK = cur && prev && prev.page === ln.page && (ln.y0 - prev.y1) <= 10;
-      if (!gapOK) { leftovers.push({ page: ln.page, text: ln.text, before: rows.length }); cur = null; prev = ln; continue; }
-    }
+    if (!/[A-Za-z0-9]/.test(joinToks([...cells.qty, ...cells.item, ...cells.desc]))) continue;        // only dots, dashes or table lines the reader mistook for text
+    if (hl && ln.yc < hl.yc + 34 && /^(units|total|or|reprint|\W*)$/i.test(joinToks([...cells.qty, ...cells.item, ...cells.desc]))) continue;   // 2nd line of the heading cell
+    let q = null;
+    if (anchors) { const a = anchors.find(a => !a.used && a.page === ln.page && Math.abs(a.y - ln.yc) <= 6); if (a && (cells.item.length || cells.desc.length)) { a.used = true; q = { text: a.text, conf: a.conf }; } }
+    if (!q) { const t = joinToks(cells.qty); if (QTY_RE.test(t)) q = { text: t, conf: Math.min(...cells.qty.map(k => k.conf ?? 100)) }; }
+    const gap = prev && prev.page === ln.page ? ln.y0 - prev.y1 : Infinity;
+    const pb = bands ? bands[ln.page] : null, bi = pb ? bandAt(pb, ln.yc) : -1, pbi = pb && prev && prev.page === ln.page ? bandAt(pb, prev.yc) : -1;
+    const haveBands = bi >= 0 && pbi >= 0;
+    let by = '';
+    if (q) by = 'qty';
+    else if (!cur || !prev || prev.page !== ln.page) by = 'first';
+    else if (cells.item.length && (!prevItem || gap > ITEM_GAP)) by = 'item';
+    else if (haveBands ? bi !== pbi : gap > CONT_GAP) by = haveBands ? 'band' : 'gap';
+    if (by) { cur = { page: ln.page, y0: ln.y0, y1: ln.y1, qty: q, by, itemLines: [], descLines: [], toks: [] }; rows.push(cur); }
     if (cells.item.length) cur.itemLines.push(joinToks(cells.item));
     if (cells.desc.length) cur.descLines.push(joinToks(cells.desc));
     cur.toks.push(...cells.item, ...cells.desc);
-    cur.y1 = ln.y1; prev = ln;
+    cur.y1 = ln.y1; prev = ln; prevItem = cells.item.length > 0;
   }
-  return { rows, leftovers };
+  return { rows, leftovers: junk };
 }
 
 function parseHeader(lines, hdr) {
@@ -798,7 +872,7 @@ function bladeSideOf(txt) {
   m = DIR_PAREN.exec(txt); return m ? m[1].toUpperCase() : '';
 }
 function streetPlateOf(it) {
-  if (!it || it.kind === 'hardware') return null;
+  if (!it || noSign(it)) return null;
   const txt = [it.itemNo, it.desc].filter(Boolean).join(' ').replace(/\s+/g, ' ');
   const m = /\b(\d{2,3})\s*mm\s*high\s*(?:st|street)\s*[\/\-]?\s*(?:b[l1i]|blades?|plates?|pl)\b/i.exec(txt);   // ("St/BI" with a capital i is the same word: the two letters look alike in most fonts)
   if (!m) return null;
@@ -872,7 +946,7 @@ const pnTitle = it => { const n = productNameOf(it); return n ? ` title="${esc(n
 const bladeFree = it => !it.customMode && !it.custom && !it.pick && !it.image && !it.hidePic && !it.autoOff;
 const bladeUntouched = it => !!it.autoBlade && it.customMode === 'yes' && !!it.custom && !it.hidePic && !it.pick && !it.image && JSON.stringify(it.custom) === it.autoBlade;
 function syncAutoBlade(it) {
-  if (it.kind === 'hardware') return;
+  if (noSign(it)) return;
   if (it.autoBlade === undefined) {                          // never looked at yet
     if (!streetPlateOf(it)) return;                          // not a street plate (yet) — look again after the next edit
     if (!bladeFree(it)) { it.autoBlade = null; return; }     // the line already has a sign, a custom sign, a deleted picture… : leave it alone for good
@@ -894,7 +968,7 @@ function syncAutoBlade(it) {
 function enrich(it) {
   const lines = String(it.desc || '').split('\n').map(s => s.trim()).filter(Boolean);
   const d = { lines, code: null, codeLine: -1, base: null, suffix: null, dims: null, orient: null, legend: null, tags: [], shapeHint: null, wording: [] };
-  if (it.kind !== 'hardware') {
+  if (!noSign(it)) {
     const dc = detectCode(lines);
     if (dc) { d.code = dc.code; d.codeLine = dc.line; }
     if (d.code) { const m = d.code.match(/^(.*\d)([A-Z]{1,2})$/); if (m) { d.base = m[1]; d.suffix = m[2]; } else d.base = d.code; }
@@ -956,9 +1030,13 @@ function parseTokens(tokens, opts = {}) {
   if (!hdr) return { header: {}, items: [], leftovers: [], rawLines, notes: ['The table heading (QTY / ITEM NO. / DESCRIPTION) was not found, so no lines could be read. Check the file or add the lines by hand.'], hdr: null };
   const geo = columnGeometry(hdr);
   const anchors = opts.qtyAnchors ? opts.qtyAnchors.map(a => ({ ...a })) : null;
-  const { rows, leftovers } = buildRows(lines, hdr, geo, anchors);
-  /* text on the jobsheet that sits on no line (a heading such as "OCEAN HILL 10 B MGC CIVIL PROJECT / CITY OF MANDURAH") can say who the following lines are for */
-  const ctxs = leftovers.map(l => ({ before: l.before || 0, org: detectOrg([l.text], { whole: true }), text: l.text })).filter(c => c.org);
+  const { rows, leftovers } = buildRows(lines, hdr, geo, anchors, opts.bands || null);
+  /* a row with no quantity, no item name and nothing that looks like a sign is a line of plain text ("MAIN ROADS", "POST HOLES IN ALL SIGNS", a contact name…).
+     It stays on the sheet as a text line, in its place. A heading that names the customer ("CITY OF MANDURAH") also says who the following lines are for. */
+  const looksLikeSign = r => r.itemLines.length > 0 || !!detectCode(r.descLines) || /\d{2,4}\s*(?:mm)?\s*[x×*]\s*\d{2,4}/i.test(r.descLines.join(' '));
+  const isText = r => !r.qty && !looksLikeSign(r);
+  const ctxs = [];
+  rows.forEach((r, ri) => { if (isText(r)) for (const ln of r.descLines) { const org = detectOrg([ln], { whole: true }); if (org) ctxs.push({ before: ri + 1, org, text: ln }); } });
   const ctxFor = i => { let c = null; for (const x of ctxs) if (x.before <= i) c = x; return c ? { org: c.org, text: c.text } : null; };
   if (anchors) {
     const unused = anchors.filter(a => !a.used);
@@ -966,8 +1044,9 @@ function parseTokens(tokens, opts = {}) {
   }
   const items = rows.map((r, ri) => {
     const issues = []; let codeAlt = [];
+    if (isText(r)) return makeItem({ kind: 'note', qty: '', itemNo: '', desc: r.descLines.join('\n'), extract: { issues, codeAlt, ocr: !!opts.ocr, codeUncertain: false } });
     const q = r.qty ? String(r.qty.text) : '';
-    if (!q) issues.push({ field: 'qty', lvl: 'bad', msg: 'Quantity could not be read — type it in from the original.' });
+    if (!q) issues.push({ field: 'qty', lvl: 'bad', msg: 'This line was found on the jobsheet, but its quantity could not be read — type it in from the original.' });
     else if (opts.ocr && (r.qty.conf ?? 0) < 90) issues.push({ field: 'qty', lvl: 'bad', msg: `Quantity read as ${q} but the reader is only ${Math.round(r.qty.conf ?? 0)}% sure — check the original.` });
     else if (!/^\d+$/.test(q)) issues.push({ field: 'qty', lvl: 'warn', msg: `Quantity “${q}” is not a whole number.` });
     const it = makeItem({ qty: q, itemNo: r.itemLines.join(' '), desc: r.descLines.join('\n'), ctx: ctxFor(ri), extract: { issues, codeAlt, ocr: !!opts.ocr, codeUncertain: false } });
@@ -1022,7 +1101,18 @@ function parseTokens(tokens, opts = {}) {
   }
   const miss = ['no', 'orderDate'].filter(k => !header[k]);
   if (miss.length) notes.push('Some job details were not found (' + miss.map(k => k === 'no' ? 'order number' : 'order date').join(', ') + ') — fill them in on the sheet.');
-  return { header, items, leftovers, rawLines, notes, hdr, geo };
+  /* the double-check: the rows read, page by page, against the rows the page's shading shows */
+  const check = { rows: items.length, text: items.filter(i => i.kind === 'note').length, pages: [], problems: [], shade: false };
+  const pgs = [...new Set([...rows.map(r => r.page), ...Object.keys(opts.bands || {}).map(Number)])].sort((x, y) => x - y);
+  for (const pg of pgs) {
+    const read = rows.filter(r => r.page === pg).length, pb = opts.bands ? opts.bands[pg] : null;
+    const usable = pb && (pb.greys >= 1 || read <= 1);
+    const shade = usable ? pb.rows : null;
+    if (shade != null) check.shade = true;
+    check.pages.push({ page: pg, read, shade });
+    if (shade != null && shade !== read) check.problems.push(`Page ${pg} of the jobsheet shows ${shade} table row${shade === 1 ? '' : 's'}, but ${read} ${read === 1 ? 'was' : 'were'} read.`);
+  }
+  return { header, items, leftovers, rawLines, notes, hdr, geo, check };
 }
 
 /* =====================================================================
@@ -1040,8 +1130,8 @@ const STATUS = {
   UNCHECKED: { label: 'NOT CHECKED', cls: 'none', help: 'No catalogue was available, so nothing was checked.' }
 };
 /* a line's sign can come from three places: the code on the jobsheet, a catalogue sign the user picked (it.pick), or a custom sign */
-const effCode = it => it.kind === 'hardware' ? null : ((it.pick && it.pick.code) || (it.d && it.d.code) || null);
-const isCustom = it => it.kind !== 'hardware' && it.customMode === 'yes';
+const effCode = it => noSign(it) ? null : ((it.pick && it.pick.code) || (it.d && it.d.code) || null);
+const isCustom = it => !noSign(it) && it.customMode === 'yes';
 const sigOf = it => [effCode(it) || '', it.d.side || '', it.d.dims ? it.d.dims.w + 'x' + it.d.dims.h : '', it.d.legend ? it.d.legend.text : ''].join('|');
 const NAME_STOP = new Set(['only', 'sign', 'signs', 'number', 'decal', 'time', 'times', 'ahead', 'aluminium', 'class', 'reflective', 'variable', 'fluoro', 'yellow', 'green']);
 const nameWords = s => [...new Set(String(s || '').toLowerCase().match(/[a-z]{4,}/g) || [])].filter(w => !NAME_STOP.has(w));
@@ -1306,7 +1396,7 @@ function setCatImage(it, m) {
 function autoFill(it, force) {
   if (!LIB) return;
   const cat = it.image && it.image.source === 'catalogue';
-  if (it.kind === 'hardware' || isCustom(it)) { if (cat) it.image = null; return; }
+  if (noSign(it) || isCustom(it)) { if (cat) it.image = null; return; }
   if (it.pick) { const m = lookupCode(it.pick.code, it.d.dims); if (m.ent && m.ent.pic) setCatImage(it, m); return; }
   if (!it.d.code) { if (cat) it.image = null; return; }
   if (it.image && it.image.source === 'manual') return;
@@ -1317,7 +1407,7 @@ function autoFill(it, force) {
 /* what the line's picture box is showing: the five states people must be able to tell apart at a glance */
 const failedImgs = new Set();
 function signState(it) {
-  if (it.kind === 'hardware') return 'none';
+  if (noSign(it)) return 'none';
   if (it.hidePic) return 'nopic';
   if (isCustom(it)) return 'custom';
   if (it.image && srcOf(it.image) && !failedImgs.has(it.id)) return 'image';
@@ -1332,7 +1422,7 @@ function searchGuess(it) {
 
 const todayStr = () => { const d = new Date(), p = n => String(n).padStart(2, '0'); return `${p(d.getDate())}/${p(d.getMonth() + 1)}/${d.getFullYear()}`; };
 function assess(it) {
-  if (it.kind === 'hardware') return null;
+  if (noSign(it)) return null;
   const d = it.d;
   if (it.hidePic) return { key: 'NOPIC', short: [], reasons: ['You deleted the picture on this line — the production notes beside it are what the workshop reads.'], alts: [] };
   if (isCustom(it)) return { key: 'CUSTOM', short: [], reasons: [bladeUntouched(it) ? 'Street blade — filled in automatically from this line (“St/Bl”): the street name, the direction ((L)/(R) or “Left Point” / “Right Point”), single or double sided, and the organisation’s colours and logo when the line or the heading above it names one. Please check them.' + (customOf(it).needDir && !customOf(it).point ? ' ⚠ This code is a POINTED blade but the jobsheet does not say Left or Right — choose it under Edit.' : '') + ' It is a reference graphic, not catalogue artwork, and it is not verified.' : 'Custom sign — drawn by this app from the wording, shape and colour you entered. It is a reference graphic, not catalogue artwork, and it is not verified.'], alts: [] };
@@ -1463,6 +1553,49 @@ function canvasFromBitmap(bmp, targetW) {
 }
 const thumbOf = (canvas, maxW = 900) => { const f = Math.min(1, maxW / canvas.width); const c = document.createElement('canvas'); c.width = Math.round(canvas.width * f); c.height = Math.round(canvas.height * f); const g = c.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height); g.drawImage(canvas, 0, 0, c.width, c.height); return c.toDataURL('image/jpeg', 0.72); };
 
+/* the table's vertical lines (the thick black one beside the quantity column above all) sit right next to the digits and are read as a "1" or a "|", or glue themselves to a real digit:
+   paint every full-height dark column of a crop white before it is enlarged and read */
+function eraseVLines(srcData, sw, sh, g, Z, pad, frac) {
+  g.fillStyle = '#fff';
+  for (let x = 0; x < sw; x++) {
+    let dark = 0; for (let y = 0; y < sh; y++) { const i = (y * sw + x) * 4; if (0.299 * srcData[i] + 0.587 * srcData[i + 1] + 0.114 * srcData[i + 2] < 140) dark++; }
+    if (dark / sh >= frac) g.fillRect(pad + (x - 1) * Z, 0, Z * 3, g.canvas.height);
+  }
+}
+/* read the quantity cell of one line on its own (enlarged). Returns { text, conf } or null. Never more sure than 80%: it is a second try. */
+async function readQtyCell(canvas, k, geo, yc, worker, stall) {
+  const sx = Math.max(0, Math.round(geo.xQtyLeft * k)), sw = Math.round((geo.xItem - 2 - geo.xQtyLeft) * k);
+  const sy = Math.max(0, Math.round((yc - 9) * k)), sh = Math.min(Math.round(18 * k), canvas.height - sy);
+  if (sw < 8 || sh < 8) return null;
+  // is there any ink at all? (a cell with nothing in it has no quantity)
+  const raw = canvas.getContext('2d').getImageData(sx, sy, sw, sh).data;
+  const lineCol = new Uint8Array(sw);                        // full-height dark columns = table lines, not digits
+  for (let x = 0; x < sw; x++) { let d = 0; for (let y = 0; y < sh; y++) { const i = (y * sw + x) * 4; if (0.299 * raw[i] + 0.587 * raw[i + 1] + 0.114 * raw[i + 2] < 140) d++; } if (d / sh >= 0.85) lineCol[x] = 1; }
+  let minX = 1e9, maxX = -1, minY = 1e9, maxY = -1, n = 0;
+  for (let y = 0; y < sh; y++) for (let x = 0; x < sw; x++) { if (lineCol[x] || lineCol[x - 1] || lineCol[x + 1]) continue; const i = (y * sw + x) * 4; if (0.299 * raw[i] + 0.587 * raw[i + 1] + 0.114 * raw[i + 2] < 150) { n++; if (x < minX) minX = x; if (x > maxX) maxX = x; if (y < minY) minY = y; if (y > maxY) maxY = y; } }
+  if (n < 6) return null;
+  const Z = 6, pad = 36, cv = document.createElement('canvas'); cv.width = sw * Z + pad * 2; cv.height = sh * Z + pad * 2;
+  const g = cv.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, cv.width, cv.height); g.imageSmoothingQuality = 'high'; g.drawImage(canvas, sx, sy, sw, sh, pad, pad, sw * Z, sh * Z);
+  eraseVLines(raw, sw, sh, g, Z, pad, 0.85);
+  { const im = g.getImageData(0, 0, cv.width, cv.height), d = im.data;                  // pure black on white: the grey shading of every second row confuses the reader
+    for (let i = 0; i < d.length; i += 4) { const v = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2] < 175 ? 0 : 255; d[i] = d[i + 1] = d[i + 2] = v; }
+    g.putImageData(im, 0, 0); }
+  for (const [psm, wl] of [['7', '0123456789'], ['10', '0123456789'], ['7', '0123456789Il|!']]) {
+    await worker.setParameters({ tessedit_pageseg_mode: psm, tessedit_char_whitelist: wl });
+    const rr = await Promise.race([worker.recognize(cv, {}, { text: true }), stall]);
+    const t = String(rr.data.text || '').replace(/\s+/g, '').replace(/[Il|!]/g, '1');
+    if (/^\d{1,5}$/.test(t)) {
+      // the width of the ink must fit the number of digits read (a "11" that was read as "1" is twice as wide as a "1")
+      const wh = (maxX - minX + 1) / Math.max(1, maxY - minY + 1), nd = t.length, lo = 0.2 + 0.55 * (nd - 1), hi = t === '1' ? 0.55 : 0.85 + 0.95 * (nd - 1);
+      return { text: t, crop: true, conf: Math.min(80, Math.max(40, rr.data.confidence || 0)), widthOk: wh >= lo * 0.85 && wh <= hi * 1.15 };
+    }
+  }
+  // a single tall, thin mark is a "1" — offered as a guess that has to be checked, never as a sure reading
+  const w = maxX - minX + 1, h = maxY - minY + 1;
+  if (h >= 5 * k && w / h <= 0.5) return { text: '1', conf: 50 };
+  return null;
+}
+
 async function ocrPage(canvas, page, progress, note) {
   const T = await loadTess();
   const k = canvas.width / PAGE_W;
@@ -1487,6 +1620,7 @@ async function ocrPage(canvas, page, progress, note) {
         const Z = 5, pad = 40, strip = document.createElement('canvas'); strip.width = sw * Z + pad * 2; strip.height = sh * Z + pad * 2;
         const g = strip.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, strip.width, strip.height); g.imageSmoothingQuality = 'high';
         g.drawImage(canvas, sx, sy, sw, sh, pad, pad, sw * Z, sh * Z);
+        eraseVLines(canvas.getContext('2d').getImageData(sx, sy, sw, sh).data, sw, sh, g, Z, pad, 0.6);
         await worker.setParameters({ tessedit_pageseg_mode: '6', tessedit_char_whitelist: '0123456789.' });
         const q = await Promise.race([worker.recognize(strip, {}, { blocks: true, text: true }), stall]);
         anchors = flattenWords(q.data).filter(w => /^\d+(\.\d+)?$/.test(w.text)).map(w => ({
@@ -1500,6 +1634,40 @@ async function ocrPage(canvas, page, progress, note) {
         }
         anchors.sort((a, b) => a.y - b.y);
       }
+    }
+    // quantities, read three independent ways: the whole-column pass above, the digits the first pass saw in the column, and the quantity cell of each line read on its own (enlarged,
+    // table lines erased). Where two of them agree the quantity is accepted; where only one saw it, or they disagree, the best guess is kept but marked "not sure" so that it is checked.
+    let bandsPg = null;
+    if (hdr) {
+      const geoH = columnGeometry(hdr);
+      bandsPg = pageBands(canvas, hdr.line.y0 - 14, geoH);
+      const strip = anchors.map(a => ({ ...a }));
+      const probe = buildRows(buildLines(tokens), hdr, geoH, strip.map(a => ({ ...a, used: false })), bandsPg ? { [page]: bandsPg } : null);
+      const vote = cs => {
+        cs = cs.filter(Boolean); if (!cs.length) return null;
+        const crop = cs.find(c => c.crop && c.widthOk !== false);                  // the reading of this line's own cell, whose ink width fits the digits, is the most careful one
+        if (crop) {
+          const agree = cs.filter(c => c !== crop && c.text === crop.text).length, clash = cs.some(c => c !== crop && c.text !== crop.text);
+          return { text: crop.text, conf: clash ? Math.min(75, crop.conf) : agree ? Math.max(92, crop.conf) : Math.min(80, crop.conf), votes: 1 + agree };
+        }
+        const by = new Map(); for (const c of cs) { const e = by.get(c.text) || { text: c.text, n: 0, conf: 0 }; e.n++; e.conf = Math.max(e.conf, c.conf); by.set(c.text, e); }
+        const best = [...by.values()].sort((x, y) => y.n - x.n || y.conf - x.conf)[0];
+        const widthBad = cs.some(c => c.text === best.text && c.widthOk === false);
+        return { text: best.text, conf: widthBad ? Math.min(70, best.conf) : best.n >= 2 ? Math.max(92, best.conf) : Math.min(80, best.conf), votes: best.n };
+      };
+      const merged = [], taken = new Set();
+      for (const r of probe.rows) {
+        if (!r.toks.length) continue;
+        if (!r.itemLines.length && !detectCode(r.descLines) && !/\d{2,4}\s*(?:mm)?\s*[x×*]\s*\d{2,4}/i.test(r.descLines.join(' '))) continue;       // plain text, not a line with a quantity
+        const yc = (r.toks[0].y0 + r.toks[0].y1) / 2;
+        const near = strip.filter(a => Math.abs(a.y - yc) <= 6).sort((x, y) => Math.abs(x.y - yc) - Math.abs(y.y - yc))[0] || null;
+        if (near) taken.add(near);
+        const tq = tokens.filter(t => /^\d+$/.test(t.t) && t.x0 >= geoH.xQtyLeft - 4 && t.x1 <= geoH.xItem + 4 && Math.abs((t.y0 + t.y1) / 2 - yc) <= 6).sort((x, y) => x.x0 - y.x0);
+        const cands = [near ? { text: near.text, conf: near.conf } : null, tq.length ? { text: tq.map(t => t.t).join(''), conf: Math.min(...tq.map(t => t.conf)) } : null, await readQtyCell(canvas, k, geoH, yc, worker, stall)];
+        const v = vote(cands);
+        if (v) merged.push({ text: v.text, conf: v.conf, page, used: false, y: yc, votes: v.votes });
+      }
+      anchors = strip.filter(a => !taken.has(a)).concat(merged).sort((x, y) => x.y - y.y);
     }
     // third pass: read each sign code again on its own, enlarged and letters/digits/dash only, so look-alikes such as B and 8 are not mixed up
     if (hdr) {
@@ -1523,7 +1691,7 @@ async function ocrPage(canvas, page, progress, note) {
         else { first.rival = txt; first.conf = Math.min(first.conf, 70); }
       }
     }
-    return { tokens, anchors };
+    return { tokens, anchors, bands: bandsPg };
   } finally { clearTimeout(stallT); if (worker) { try { await worker.terminate(); } catch (e) { } } }
 }
 
@@ -1531,7 +1699,7 @@ const HOSTED_MSG = 'This online copy can read PDFs that contain selectable text.
 async function readFileToJob(file, progress) {
   const isPdf = file.type === 'application/pdf' || /\.pdf$/i.test(file.name);
   if (HOSTED && !isPdf) throw new Error(HOSTED_MSG);
-  const out = { name: file.name, method: '', pages: 0, previews: [], tokens: [], anchors: [], ocr: false };
+  const out = { name: file.name, method: '', pages: 0, previews: [], tokens: [], anchors: [], bands: {}, ocr: false };
   if (isPdf) {
     progress(0.03, 'Loading the PDF reader…');
     const pdfjs = await loadPdfJs();
@@ -1559,12 +1727,17 @@ async function readFileToJob(file, progress) {
       await page.render({ canvasContext: cv.getContext('2d'), viewport: view }).promise;
       canvases.push(cv); out.previews.push(thumbOf(cv));
     }
-    if (out.tokens.length >= 25) { out.method = 'PDF text'; return out; }
+    if (out.tokens.length >= 25) {
+      out.method = 'PDF text';
+      const lines = buildLines(out.tokens), hdr = findHeader(lines);                    // the shading of each page's table, to double-check the rows
+      if (hdr) { const geo = columnGeometry(hdr); canvases.forEach((cv, i) => { const hl = lines.find(l => l.page === i + 1 && isHeaderLine(l)); const pb = pageBands(cv, (hl || hdr.line).y0 - 14, geo); if (pb) out.bands[i + 1] = pb; }); }
+      return out;
+    }
     if (HOSTED) throw new Error(HOSTED_MSG);
     out.ocr = true; out.method = 'OCR of scanned PDF'; out.tokens = [];
     for (let i = 0; i < canvases.length; i++) {
       const r = await ocrPage(canvases[i], i + 1, f => progress(0.3 + 0.65 * ((i + f) / canvases.length), `Reading page ${i + 1} (picture reading, can take a minute)…`), t => progress(null, t));
-      out.tokens.push(...r.tokens); out.anchors.push(...r.anchors);
+      out.tokens.push(...r.tokens); out.anchors.push(...r.anchors); if (r.bands) out.bands[i + 1] = r.bands;
     }
     return out;
   }
@@ -1574,7 +1747,7 @@ async function readFileToJob(file, progress) {
   const cv = canvasFromBitmap(bmp, 2000);
   out.previews.push(thumbOf(cv));
   const r = await ocrPage(cv, 1, f => progress(0.15 + 0.8 * f, 'Reading the picture (can take a minute)…'), t => progress(null, t));
-  out.tokens = r.tokens; out.anchors = r.anchors;
+  out.tokens = r.tokens; out.anchors = r.anchors; if (r.bands) out.bands[1] = r.bands;
   return out;
 }
 
@@ -1635,7 +1808,7 @@ function rowHTML(it, idx, sec) {
   const cell = hw ? '' : imgCellHTML(it);
   const nline = showNote ? `<div class="nline${it.notes ? '' : ' empty'}"><span class="nl">DISPATCH NOTE:</span><textarea class="fld" rows="1" data-f="notes" placeholder="Add a dispatch note…" aria-label="Notes for this line">${esc(it.notes)}</textarea></div>` : '';
   const delLabel = hw ? 'Delete line' : 'Delete sign';
-  return `<div class="row ${hw ? 'hw' : 'sg'}${idx % 2 ? ' alt' : ''}${selected.has(it.id) ? ' sel' : ''}" data-id="${it.id}" data-sec="${sec}">`
+  return `<div class="row ${hw ? 'hw' : 'sg'}${it.kind === 'note' ? ' txt' : ''}${idx % 2 ? ' alt' : ''}${selected.has(it.id) ? ' sel' : ''}" data-id="${it.id}" data-sec="${sec}">`
     + `<div class="qty"><input class="fld" data-f="qty" value="${esc(it.qty)}" inputmode="decimal" aria-label="Quantity"></div>`
     + `<div class="item"><textarea class="fld" rows="1" data-f="itemNo" aria-label="Item number">${esc(it.itemNo)}</textarea></div>`
     + `<div class="desc">${edited(it)}<div class="dmain"><div class="dtext${cell ? '' : ' wide'}"><textarea class="fld" rows="1" data-f="desc" aria-label="Description">${esc(it.desc)}</textarea></div>${cell}</div>${nline}</div>`
@@ -1681,10 +1854,12 @@ function pageHTML(sc, pi, n, idxs) {
   const top = first ? fullHeaderHTML() : compactHeaderHTML(sec, pi, n);
   const lg = first ? P1.legend : PN.legend, tb = first ? P1.table : PN.table;
   const label = sec === 'prod' ? 'Workshop production copy' : 'Pick and pack / dispatch copy';
+  const lnums = rangesOf(idxs.map(i => lineNo(sc.items[i].id))), nadd = idxs.filter(i => !lineNo(sc.items[i].id)).length;
+  const lineTxt = lnums || nadd ? ` · line${/[,–]/.test(lnums) ? 's' : ''} ${lnums}${lnums ? ' of ' + S.originalOrder.length : ''}${nadd ? (lnums ? ' + ' : '') + nadd + ' added' : ''}` : '';
   return `<section class="page ${sec}" data-sec="${sec}" data-page="${pi}" data-first="${first ? 1 : 0}">${banner}${top}
   <div class="legend" style="top:${lg}px">${esc(LEGEND)}</div>
   <div class="tbl" style="top:${tb}px">${theadHTML()}<div class="rows">${idxs.map(i => rowHTML(sc.items[i], i, sec)).join('')}${fillHTML()}</div></div>
-  <div class="pfoot"><span>${label} · Order <span data-hv="no">${esc(S.header.no)}</span> · page ${pi + 1} of ${n}</span><span>Printed <span class="ts">—</span></span></div></section>`;
+  <div class="pfoot"><span>${label} · Order <span data-hv="no">${esc(S.header.no)}</span> · page ${pi + 1} of ${n}${lineTxt}</span><span>Printed <span class="ts">—</span></span></div></section>`;
 }
 function paginate(heights, first, next) {
   const pages = [[]]; let used = 0, budget = first;
@@ -1752,6 +1927,59 @@ function fitStage() {
 }
 
 /* =====================================================================
+   Every line accounted for: what the jobsheet has, what the sheets show, what was deleted
+   ===================================================================== */
+const REMOVED_SNAP = new Map();                         // full copies of deleted lines (this session only), so "Put back" gives the same line
+const lineNo = id => { const i = S.originalOrder.indexOf(id); return i >= 0 ? i + 1 : 0; };
+function rangesOf(nums) {                               // [1,2,3,5,6] -> "1–3, 5–6"
+  const a = [...new Set(nums)].filter(n => n > 0).sort((x, y) => x - y), out = [];
+  for (let i = 0; i < a.length;) { let j = i; while (j + 1 < a.length && a[j + 1] === a[j] + 1) j++; out.push(j > i ? `${a[i]}–${a[j]}` : `${a[i]}`); i = j + 1; }
+  return out.join(', ');
+}
+function countStatus() {
+  const total = S.originalOrder.length, present = S.originalOrder.filter(id => byId(id));
+  const gone = S.originalOrder.filter(id => !byId(id)).map(id => ({ id, n: lineNo(id), ...(S.removedInfo[id] || {}) }));
+  const noQty = S.items.filter(i => !noSign(i) && !String(i.qty).trim()).length;
+  const texts = S.items.filter(i => i.kind === 'note').length, signs = S.items.filter(i => i.kind !== 'hardware' && i.kind !== 'note').length, hw = S.items.filter(i => i.kind === 'hardware').length;
+  const problems = (S.check && S.check.problems) || [];
+  return { total, shown: present.length, gone, noQty, texts, signs, hw, problems, shade: !!(S.check && S.check.shade), added: S.items.filter(i => lineNo(i.id) === 0).length };
+}
+const lineTitle = x => `Line ${x.n}${x.itemNo || x.desc ? ' · ' + esc1(String(x.desc || x.itemNo).split('\n')[0]) : ''}${x.qty ? ' × ' + esc(x.qty) : ''}`;
+function updateCountBar() {
+  const box = $('#countBar'); if (!box) return;
+  if (!S.originalOrder.length) { box.innerHTML = ''; return; }
+  const c = countStatus();
+  if (!S.check) {                                                  // a job saved by an older version: its lines were found by the old reader, which could miss some
+    box.innerHTML = `<div class="cb warn"><span class="big">⚠ This job was scanned by an older version of the app</span><div>The older scanner could leave lines off the sheet without telling you. <b>Scan the jobsheet again</b> (“New jobsheet” at the top → choose the PDF) so that every line is counted and double-checked, or compare this sheet with the original line by line.</div></div>`;
+    return;
+  }
+  const parts = [`${c.signs} sign line${c.signs === 1 ? '' : 's'}`, c.hw ? `${c.hw} dispatch line${c.hw === 1 ? '' : 's'}` : '', c.texts ? `${c.texts} text line${c.texts === 1 ? '' : 's'}` : ''].filter(Boolean).join(' · ');
+  let cls = 'ok', head = `✔ All ${c.total} line${c.total === 1 ? '' : 's'} of the jobsheet are on these sheets`, extra = [];
+  extra.push(`<div>${parts}${c.added ? ` · ${c.added} added by you` : ''}.</div>`);
+  if (c.shade) extra.push('<div>Double-checked against the page picture: the number of table rows on the original page matches.</div>');
+  else extra.push('<div>The page picture could not be used to double-check the count (no row shading found) — compare the line numbers with the original yourself.</div>');
+  if (c.problems.length) { cls = 'bad'; head = `⚠ The line count does not add up — check the original jobsheet`; extra.push(`<ul>${c.problems.map(p => `<li>${esc(p)} Compare this sheet with the original page, line by line (“Original jobsheet” in the side panel), and add any missing line with the buttons on the left.</li>`).join('')}</ul>`); }
+  if (c.gone.length) {
+    if (cls !== 'bad') cls = 'warn';
+    head = `⚠ ${c.shown} of the ${c.total} lines of the jobsheet are on these sheets — you deleted ${c.gone.length}`;
+    extra.push(`<ul>${c.gone.map(x => `<li><b>${esc(lineTitle(x))}</b> was deleted. <button class="btn small" data-putback="${esc(x.id)}">Put back</button></li>`).join('')}</ul>`);
+  }
+  if (c.noQty) { if (cls === 'ok') cls = 'warn'; extra.push(`<div><b>${c.noQty} line${c.noQty === 1 ? ' has' : 's have'} no quantity</b> — the line was found, but its quantity could not be read. Type it in from the original (see “Needs attention”).</div>`); }
+  box.innerHTML = `<div class="cb ${cls}"><span class="big">${head}</span>${extra.join('')}</div>`;
+}
+function putBack(id) {
+  const info = S.removedInfo[id]; if (!info || byId(id)) return;
+  pushHistory();
+  const snap = REMOVED_SNAP.get(id);
+  const it = snap ? clone(snap) : makeItem({ kind: info.kind || 'unknown', qty: info.qty || '', itemNo: info.itemNo || '', desc: info.desc || '' });
+  it.id = id; enrich(it); autoFill(it);
+  const myPos = S.originalOrder.indexOf(id);
+  let at = S.items.findIndex(x => { const p = S.originalOrder.indexOf(x.id); return p > myPos; });
+  if (at < 0) at = S.items.length;
+  S.items.splice(at, 0, it); delete S.removedInfo[id]; REMOVED_SNAP.delete(id);
+  render(); scheduleSave(); flash(id); toast(`Put back line ${myPos + 1}`);
+}
+/* =====================================================================
    Side panel
    ===================================================================== */
 function seqLabel(it) { const i = S.originalOrder.indexOf(it.id); return i >= 0 ? `Line ${i + 1}` : 'New line'; }
@@ -1780,12 +2008,14 @@ function computeExceptions() {
   return out.sort((x, y) => LVL_RANK[x.lvl] - LVL_RANK[y.lvl]);
 }
 function updateSide() {
+  updateCountBar();
   const signs = S.items.filter(i => i.kind !== 'hardware').length, hw = S.items.length - signs;
   const tally = {}; for (const it of S.items) { const a = assess(it); if (a) tally[a.key] = (tally[a.key] || 0) + 1; }
   const pills = ['VERIFIED', 'POTENTIAL', 'MISMATCH', 'NOTFOUND', 'REVIEW', 'NOSIGN', 'CUSTOM', 'NOPIC', 'UNCHECKED'].filter(k => tally[k]).map(k => `<span class="pillst ${STATUS[k].cls}" title="${esc(STATUS[k].label)}">${tally[k]} ${esc(STATUS[k].label)}</span>`).join(' ');
   $('#pJob').innerHTML = `<h2>Job</h2><div class="jobline">Order ${esc(S.header.no || '—')}${S.header.billTo ? ' · ' + esc(S.header.billTo.split('\n')[0]) : ''}</div>
     <div class="small">${esc(S.source.name || '')}${S.source.method ? ' · read by ' + esc(S.source.method) : ''}</div>
     <div class="small">${signs} workshop line${signs === 1 ? '' : 's'} · ${hw} dispatch line${hw === 1 ? '' : 's'}</div>
+    <div class="small">Lines on the jobsheet: <b>${S.originalOrder.length}</b> · on these sheets: <b>${S.originalOrder.filter(id => byId(id)).length}</b></div>
     ${pills ? `<div style="margin-top:6px;line-height:1.9">${pills}</div>` : ''}
     ${S.readNotes.map(n => `<div class="small" style="color:var(--warn);margin-top:6px">⚠ ${esc(n)}</div>`).join('')}`;
   const ex = computeExceptions();
@@ -1795,8 +2025,7 @@ function updateSide() {
   const li = e => `<li class="${e.lvl}" data-goto="${e.id}"><b>${esc(e.title)}</b>${e.msgs.map(m => `<div>${esc(m.msg)}</div>${m.btns && m.btns.length ? `<div class="alt">${m.btns.map(b => btn(b, e.id)).join('')}</div>` : ''}`).join('')}</li>`;
   $('#pExc').innerHTML = `<h2>Needs attention <span class="count ${attention.length ? (bad ? 'bad' : '') : 'ok'}">${attention.length}</span></h2>`
     + (attention.length ? `<ul class="exc">${attention.map(li).join('')}</ul>` : '<div class="small">Nothing needs attention.</div>')
-    + (unchecked.length ? `<details style="margin-top:8px"><summary class="small" style="cursor:pointer">${unchecked.length} sign line${unchecked.length === 1 ? ' has' : 's have'} no picture yet</summary>${S.items.some(i => signState(i) === 'empty') ? '<div style="margin-top:6px"><button class="btn small" data-sact="hide-empty" title="Removes the empty Add-sign boxes (the lines stay)">Hide all empty sign boxes</button></div>' : ''}<ul class="exc" style="margin-top:6px">${unchecked.map(li).join('')}</ul></details>` : '')
-    + (S.leftovers.length ? `<div class="small" style="margin-top:8px"><b>Other text on the page (kept, not placed on a line):</b><br>${S.leftovers.map(l => esc(l.text)).join('<br>')}</div>` : '');
+    + (unchecked.length ? `<details style="margin-top:8px"><summary class="small" style="cursor:pointer">${unchecked.length} sign line${unchecked.length === 1 ? ' has' : 's have'} no picture yet</summary>${S.items.some(i => signState(i) === 'empty') ? '<div style="margin-top:6px"><button class="btn small" data-sact="hide-empty" title="Removes the empty Add-sign boxes (the lines stay)">Hide all empty sign boxes</button></div>' : ''}<ul class="exc" style="margin-top:6px">${unchecked.map(li).join('')}</ul></details>` : '');
   $('#pLib').innerHTML = '<h2>Sign catalogue</h2>' + (LIB
     ? `<div class="small"><b>${esc(LIB.meta.title || 'Catalogue')}</b><br>${LIB.count} sign codes and ${LIB.picCount} pictures, taken from <b>${esc(LIB.meta.file || 'the catalogue PDF')}</b>${LIB.meta.built ? ' (built ' + esc(LIB.meta.built) + ')' : ''}.</div><div class="small" style="margin-top:6px">This is the only catalogue the app uses. The codes, sizes and pictures were read from the catalogue pages by picture reading, so a few can be wrong. Every picture on the sheet shows its catalogue page number (“CAT. p.”, the number printed at the bottom of the page) so it can be checked; the PDF viewer's own page number is 3 higher. Only the sign pages are included — not the accessories, fixings or posts pages. When the catalogue changes, the app needs to be rebuilt from the new PDF.</div>`
     : '<div class="small">This copy of the app has no catalogue built in, so pictures are added by hand. Use the saved copy of the app (the .html file) to get pictures automatically.</div>');
@@ -1805,6 +2034,7 @@ function updateSide() {
     : '<div class="small">The original page picture was not kept for this saved job.</div>');
   $('#rawText').textContent = S.rawLines.join('\n') || '(nothing)';
   $('#legendKey').innerHTML = Object.values(STATUS).map(s => `<div><span class="pillst ${s.cls}">${s.label}</span><span class="small">${esc(s.help)}</span></div>`).join('')
+    + '<div class="small" style="margin-top:6px"><b>The bar above the sheets</b> counts the lines of the jobsheet against the lines on the sheets. Green = they match (and the shading of the original page agrees); amber = you deleted a line, a quantity is missing, or the job is from an older version of the app; red = the page shows a different number of rows than were read. The page footers list the line numbers on each page, so a gap shows on paper too.</div>'
     + '<div class="small" style="margin-top:6px">The app only calls a line <b>verified</b> when the code is found exactly in the catalogue and the jobsheet size agrees. A picture that merely looks right is never enough. This is a check to help you — it is not a guarantee, so keep looking at the original.</div>';
 }
 
@@ -1849,6 +2079,7 @@ function gotoItem(id) { const r = $(`.row[data-id="${id}"]`); if (r) { r.scrollI
 function removeItems(ids) {
   const gone = S.items.filter(x => ids.includes(x.id)); if (!gone.length) return;
   pushHistory(snapshotData());                              // one snapshot, so one Undo brings every deleted line back
+  gone.forEach(x => { if (lineNo(x.id)) { S.removedInfo[x.id] = { qty: x.qty, itemNo: x.itemNo, desc: x.desc, kind: x.kind }; REMOVED_SNAP.set(x.id, clone(x)); } });
   S.items = S.items.filter(x => !ids.includes(x.id));
   gone.forEach(x => { selected.delete(x.id); failedImgs.delete(x.id); });
   if (SP.open && ids.includes(SP.id)) closeSearch(false);
@@ -1877,7 +2108,7 @@ function addLine(kind) {
 }
 /* delete the picture but keep the line and its notes (nothing is thrown away: the picture comes back with “Add picture”, and Undo) */
 function setNoPic(id, on) {
-  const it = byId(id); if (!it || it.kind === 'hardware') return;
+  const it = byId(id); if (!it || noSign(it)) return;
   pushHistory(); it.hidePic = !!on; render(); scheduleSave();
   toast(on ? 'Picture deleted — the Notes box stays' : 'Picture box is back', { label: 'Undo', fn: undo });
   if (on) requestAnimationFrame(() => { const el = $(`.row[data-id="${id}"] [data-f="notes"]`); if (el && !it.notes) el.focus({ preventScroll: true }); });
@@ -1993,7 +2224,7 @@ const spBody = () => $('#spBody');
 const SEARCH_ICON = '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5"/><path d="M13 13l4.5 4.5"/></svg>';
 function lineLabel(it) { const i = S.originalOrder.indexOf(it.id); const w = (it.d.wording[0] || it.itemNo || '').slice(0, 44); return (i >= 0 ? `Line ${i + 1}` : 'New line') + (w ? ' · ' + w : ''); }
 function openSearch(id, o = {}) {
-  const it = byId(id); if (!it || it.kind === 'hardware') return;
+  const it = byId(id); if (!it || noSign(it)) return;
   closePop(); closeOpt();
   const st = signState(it);
   SP.open = true; SP.id = id; SP.res = null; SP.active = 0; SP.cfDirty = false;
@@ -2112,7 +2343,7 @@ function resultHTML(r, i, it) {
 function jobSigns(excludeId) {
   const out = [], seen = new Set();
   for (const it of S.items) {
-    if (it.id === excludeId || it.kind === 'hardware') continue;
+    if (it.id === excludeId || noSign(it)) continue;
     if (isCustom(it)) { const c = customOf(it), k = 'c|' + c.text + '|' + c.shape + '|' + c.w + 'x' + c.h + '|' + (hexOf(c.bg) || '') + '|' + (hexOf(c.fg) || '') + '|' + (c.keep ? 1 : 0) + '|' + (c.point || '') + (c.cut || '') + '|' + (c.sides || ''); if (!seen.has(k)) { seen.add(k); out.push({ type: 'custom', c: { ...c }, key: k }); } }
   }
   return out;
@@ -2420,7 +2651,7 @@ function positionOpt() {
 }
 function fillOpt() {
   const it = byId(optId); if (!it) { closeOpt(); return; }
-  const hw = it.kind === 'hardware', custom = !hw && isCustom(it), a = assess(it);
+  const hw = noSign(it), custom = !hw && isCustom(it), a = assess(it);
   $('#optCode').textContent = effCode(it) ? '— ' + effCode(it) : (it.d.wording[0] ? '— ' + it.d.wording[0].slice(0, 24) : (it.itemNo ? '— ' + it.itemNo : ''));
   let h = '';
   if (!hw) {
@@ -2798,6 +3029,12 @@ function stampPrintTime() {
 }
 async function printSheets(which) {
   closePop(); closeOpt(); closeSearch(false); render();
+  /* never send a sheet to the workshop without being told that something does not add up */
+  const c = countStatus(), warn = [];
+  if (c.problems.length) warn.push('The line count does not add up: ' + c.problems.join(' '));
+  if (c.gone.length) warn.push(`You deleted ${c.gone.length} line${c.gone.length === 1 ? '' : 's'} of the jobsheet (line ${c.gone.map(x => x.n).join(', ')}).`);
+  if (c.noQty) warn.push(`${c.noQty} line${c.noQty === 1 ? ' has' : 's have'} no quantity.`);
+  if (warn.length && !window.confirm('Before printing:\n\n• ' + warn.join('\n• ') + '\n\nPrint anyway?')) return;
   document.body.classList.remove('print-prod', 'print-disp');
   if (which === 'prod') document.body.classList.add('print-prod'); if (which === 'disp') document.body.classList.add('print-disp');
   if (which === 'disp' && !S.items.some(i => i.kind === 'hardware')) { document.body.classList.remove('print-disp'); toast('There are no dispatch lines to print.'); return; }
@@ -2832,15 +3069,15 @@ $('#btnRead').addEventListener('click', async () => {
   if (!chosen) return; $('#btnRead').disabled = true; setMsg('Starting…'); setProg(0.02);
   try {
     const job = await readFileToJob(chosen, setProg); window.JSV.lastJob = job;
-    const res = parseTokens(job.tokens, { ocr: job.ocr, qtyAnchors: job.ocr ? job.anchors : null });
+    const res = parseTokens(job.tokens, { ocr: job.ocr, qtyAnchors: job.ocr ? job.anchors : null, bands: job.bands });
     if (!res.items.length) { setMsg(res.notes[0] || 'No lines could be read from this file.', true); $('#btnRead').disabled = false; $('#prog').classList.remove('on'); return; }
-    loadJob({ source: { name: job.name, method: job.method, pages: job.pages, previews: job.previews }, header: { ...DEFAULT_HEADER, ...res.header }, items: res.items, originalOrder: res.items.map(i => i.id), leftovers: res.leftovers, rawLines: res.rawLines, readNotes: res.notes });
+    loadJob({ source: { name: job.name, method: job.method, pages: job.pages, previews: job.previews }, header: { ...DEFAULT_HEADER, ...res.header }, items: res.items, originalOrder: res.items.map(i => i.id), leftovers: res.leftovers, rawLines: res.rawLines, readNotes: res.notes, check: res.check });
     setProg(1, 'Done'); const sg = res.items.filter(i => i.kind !== 'hardware').length;
     toast(`Read ${res.items.length} lines (${sg} workshop, ${res.items.length - sg} dispatch). Check the “Needs attention” list.`);
   } catch (err) { console.error(err); setMsg('Sorry — this file could not be read: ' + (err && err.message ? err.message : err), true); $('#btnRead').disabled = false; $('#prog').classList.remove('on'); }
 });
 function loadJob(j) {
-  S.source = j.source; S.header = j.header; S.items = j.items; S.originalOrder = j.originalOrder; S.leftovers = j.leftovers || []; S.rawLines = j.rawLines || []; S.readNotes = j.readNotes || [];
+  S.source = j.source; S.header = j.header; S.items = j.items; S.originalOrder = j.originalOrder; S.leftovers = j.leftovers || []; S.rawLines = j.rawLines || []; S.readNotes = j.readNotes || []; S.check = j.check || null; S.removedInfo = j.removedInfo || {};
   /* a job saved while the app used a different catalogue: its catalogue pictures, chosen signs and hand-checks refer to that other catalogue, so they are cleared and looked up again in this one */
   let reset = 0;
   if (LIB) { const id = libId(); S.items.forEach(it => { let hit = false;
@@ -2861,9 +3098,10 @@ function showResume() {
   const sv = loadSaved(), box = $('#resume');
   if (sv && sv.items && sv.items.length) { box.hidden = false; $('#resumeTxt').textContent = `Last job: Order ${sv.header.no || '—'} (${sv.items.length} lines, saved ${new Date(sv.savedAt).toLocaleString()}).`; } else box.hidden = true;
 }
-$('#btnResume').addEventListener('click', () => { const sv = loadSaved(); if (!sv) return; loadJob({ source: sv.source || { name: '', method: '', previews: [] }, header: { ...DEFAULT_HEADER, ...sv.header }, items: sv.items, originalOrder: sv.originalOrder || sv.items.map(i => i.id), leftovers: sv.leftovers || [], rawLines: sv.rawLines || [], readNotes: sv.readNotes || [] }); });
+$('#btnResume').addEventListener('click', () => { const sv = loadSaved(); if (!sv) return; loadJob({ source: sv.source || { name: '', method: '', previews: [] }, header: { ...DEFAULT_HEADER, ...sv.header }, items: sv.items, originalOrder: sv.originalOrder || sv.items.map(i => i.id), leftovers: sv.leftovers || [], rawLines: sv.rawLines || [], readNotes: sv.readNotes || [], check: sv.check || null, removedInfo: sv.removedInfo || {} }); });
 $('#btnForget').addEventListener('click', () => { forgetSaved(); showResume(); });
 showResume();
+$('#countBar').addEventListener('click', e => { const b = e.target.closest('[data-putback]'); if (b) putBack(b.dataset.putback); });
 if (HOSTED) {
   $('#hostedNote').hidden = false; $('#hostedNote').textContent = HOSTED_MSG;
   $('#btnPrintAll').hidden = true; $('#btnPreview').hidden = true;
@@ -2871,7 +3109,7 @@ if (HOSTED) {
 }
 
 /* exposed for testing */
-window.JSV = { autoBladeFor, readBladeSpec, productNameOf, detectOrg, colourWord, fgKey, TPL, BT: () => BT, resyncBlades, exportTemplates, syncAutoBlade, streetNameOf, bladeUntouched, markPrintPages, S, parseTokens, buildLines, enrich, assess, classify, isSignCode, altCodes, paginate, render, attachImage, moveItem, step, removeItem, toggleKind, addLine, restoreOrder, undo, loadJob, DEFAULT_HEADER, BUDGET_FIRST, BUDGET_NEXT, byId, history: () => history, lookupCode, autoFill, isCustom, setCustom, confirmItem, openOpt, optAct, googleQuery, openGoogle, setNoPic, streetPlateOf, autoNoteFor, mergeStreetNote, STREET_CUT, customSVG, readColours, fitLines, customGeom, LIB: () => LIB, srcOf, makeItem,
+window.JSV = { countStatus, putBack, pageBands, readFileToJob, searchSigns, buildIndex, autoBladeFor, readBladeSpec, productNameOf, detectOrg, colourWord, fgKey, TPL, BT: () => BT, resyncBlades, exportTemplates, syncAutoBlade, streetNameOf, bladeUntouched, markPrintPages, S, parseTokens, buildLines, enrich, assess, classify, isSignCode, altCodes, paginate, render, attachImage, moveItem, step, removeItem, toggleKind, addLine, restoreOrder, undo, loadJob, DEFAULT_HEADER, BUDGET_FIRST, BUDGET_NEXT, byId, history: () => history, lookupCode, autoFill, isCustom, setCustom, confirmItem, openOpt, optAct, googleQuery, openGoogle, setNoPic, streetPlateOf, autoNoteFor, mergeStreetNote, STREET_CUT, customSVG, readColours, fitLines, customGeom, LIB: () => LIB, srcOf, makeItem,
   removeItems, selected, deleteSelected, signState, shapeOf, shapeLabel, effCode, detectCode, customSVG, shapeSVG, customOf, searchSigns, openSearch, closeSearch, chooseCatalogue, applyCustom, retryLookup, hideEmptyBoxes, SP, failedImgs, searchGuess, dimsOf };
 })();
 </script>
